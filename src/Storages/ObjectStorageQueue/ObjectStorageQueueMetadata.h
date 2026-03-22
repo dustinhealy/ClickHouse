@@ -112,6 +112,23 @@ public:
     /// (rewrites what we write in syncWithKeeper()).
     void alterSettings(const SettingsChanges & changes, const ContextPtr & context);
 
+    enum class PathState
+    {
+        /// The path has been successfully processed.
+        Processed,
+        /// The path has failed processing; the failure message is populated.
+        Failed,
+        /// The path has not been processed yet.
+        Unknown,
+    };
+
+    /// Check Keeper to determine whether `path` has already been processed or failed.
+    /// For unordered mode checks per-file processed/failed nodes.
+    /// For ordered mode compares `path` against the stored last-processed pointer,
+    /// and checks the per-file failed node.
+    /// Sets `failure_message` when the result is `Failed`.
+    PathState getPathState(const std::string & path, std::string & failure_message) const;
+
     /// Get object storage type: s3, azure, local, etc.
     ObjectStorageType getType() const { return storage_type; }
     /// Get base path to keeper metadata.

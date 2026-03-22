@@ -120,6 +120,7 @@ public:
     const std::string & getProcessorInfo() const { return processor_info; }
 
     static std::string generateProcessingID();
+    static std::string getNodeName(const std::string & path);
 
     virtual bool useBucketsForProcessing() const { return false; }
     virtual size_t getBucket() const { throw Exception(ErrorCodes::LOGICAL_ERROR, "Buckets are not supported"); }
@@ -221,8 +222,6 @@ protected:
     std::string processor_info;
 
     bool checkProcessingOwnership(std::shared_ptr<ZooKeeperWithFaultInjection> zk_client);
-
-    static std::string getNodeName(const std::string & path);
 
     static NodeMetadata createNodeMetadata(const std::string & path, const std::string & exception = {}, size_t retries = 0);
 

@@ -8,6 +8,7 @@
 #include <IO/CompressionMethod.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
+#include <Interpreters/ProcessList.h>
 #include <Interpreters/InterpreterInsertQuery.h>
 #include <Parsers/ASTCreateQuery.h>
 #include <Parsers/ASTFunction.h>
@@ -21,7 +22,9 @@
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Storages/AlterCommands.h>
 #include <Storages/ObjectStorage/Utils.h>
+#include <Storages/ObjectStorageQueue/ObjectStorageQueueIFileMetadata.h>
 #include <Storages/ObjectStorageQueue/ObjectStorageQueueMetadata.h>
+#include <Storages/ObjectStorageQueue/ObjectStorageQueueOrderedFileMetadata.h>
 #include <Storages/StreamingStorageRegistry.h>
 #include <Storages/ObjectStorageQueue/ObjectStorageQueueSettings.h>
 #include <Storages/ObjectStorageQueue/ObjectStorageQueueTableMetadata.h>
@@ -34,11 +37,15 @@
 #include <Common/FailPoint.h>
 #include <Common/Macros.h>
 #include <Common/ProfileEvents.h>
+#include <Common/ZooKeeper/IKeeper.h>
+#include <Common/ZooKeeper/ZooKeeper.h>
 #include <Common/ZooKeeper/ZooKeeperCommon.h>
 #include <Common/ZooKeeper/ZooKeeperRetries.h>
+#include <Common/ZooKeeper/ZooKeeperWithFaultInjection.h>
 #include <Common/randomSeed.h>
 
 #include <filesystem>
+#include <Poco/Event.h>
 
 #include <fmt/ranges.h>
 
@@ -136,6 +143,7 @@ namespace ErrorCodes
     extern const int NOT_IMPLEMENTED;
     extern const int FAULT_INJECTED;
     extern const int KEEPER_EXCEPTION;
+    extern const int QUERY_WAS_CANCELLED;
 }
 
 namespace
@@ -1702,6 +1710,107 @@ String StorageObjectStorageQueue::chooseZooKeeperPath(
     if (result_zookeeper_name)
         *result_zookeeper_name = zkutil::extractZooKeeperName(result_zk_path);
     return zkutil::extractZooKeeperPath(result_zk_path, true);
+}
+
+void StorageObjectStorageQueue::waitForPathToBeProcessed(
+    const std::string & path,
+    ContextPtr local_context) const
+{
+    auto component_guard = Coordination::setCurrentComponent("StorageObjectStorageQueue::waitForPathToBeProcessed");
+    const auto node_name = ObjectStorageQueueIFileMetadata::getNodeName(path);
+
+    /// Determine the Keeper paths we need to watch.
+    /// For unordered mode each file gets its own node under processed/ and failed/.
+    /// For ordered mode the processed pointer is a shared node whose *data* is updated,
+    /// while the failed node is still per-file.
+    const bool is_ordered = files_metadata->getTableMetadata().getMode() == ObjectStorageQueueMode::ORDERED;
+    const bool uses_buckets = files_metadata->useBucketsForProcessing();
+
+    std::string processed_node_path;
+    if (is_ordered)
+    {
+        const size_t effective_buckets = uses_buckets ? files_metadata->getBucketsNum() : 1;
+        const auto bucket = ObjectStorageQueueOrderedFileMetadata::getBucketForPath(
+            path,
+            effective_buckets,
+            files_metadata->getBucketingMode(),
+            files_metadata->getPartitioningMode(),
+            files_metadata->getFilenameParser());
+        processed_node_path = uses_buckets
+            ? (zk_path / "buckets" / toString(bucket) / "processed").string()
+            : (zk_path / "processed").string();
+    }
+    else
+    {
+        processed_node_path = (zk_path / "processed" / node_name).string();
+    }
+
+    const auto failed_node_path = (zk_path / "failed" / node_name).string();
+
+    LOG_DEBUG(log, "Waiting for path '{}' to be processed by {}", path, getStorageID().getNameForLogs());
+
+    while (true)
+    {
+        if (shutdown_called || table_is_being_dropped)
+            throw Exception(ErrorCodes::QUERY_WAS_CANCELLED,
+                "Table {} is being dropped or server is shutting down",
+                getStorageID().getNameForLogs());
+
+        if (auto query_status = local_context->getProcessListElementSafe())
+            query_status->throwIfKilled();
+
+        /// Check current state first, then arm watches.
+        /// The watch is set *after* the state check so we cannot miss a transition:
+        /// if the node appeared between the state check and the watch registration
+        /// the next iteration's state check will catch it immediately.
+        std::string failure_message;
+        const auto state = files_metadata->getPathState(path, failure_message);
+
+        if (state == ObjectStorageQueueMetadata::PathState::Processed)
+        {
+            LOG_DEBUG(log, "Path '{}' has been processed by {}", path, getStorageID().getNameForLogs());
+            return;
+        }
+        if (state == ObjectStorageQueueMetadata::PathState::Failed)
+        {
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Path '{}' failed to be processed by {}: {}",
+                path, getStorageID().getNameForLogs(), failure_message);
+        }
+
+        /// Not yet processed — arm watches so we wake up as soon as either node changes.
+        /// Watches are one-shot in Keeper, so we re-register them on each iteration.
+        /// We pass an EventPtr so both watches share the same event.
+        auto event = std::make_shared<Poco::Event>();
+        {
+            /// Watch operations require the raw ZooKeeper client because
+            /// ZooKeeperWithFaultInjection does not expose the watch API directly.
+            auto zk = files_metadata->getZooKeeper()->getKeeper();
+
+            if (is_ordered)
+            {
+                /// The processed node already exists (it stores the last-processed pointer).
+                /// Watch it for data changes (NodeDataChanged event).
+                std::string dummy_data;
+                Coordination::Stat dummy_stat{};
+                zk->tryGetWatch(processed_node_path, dummy_data, &dummy_stat, event);
+            }
+            else
+            {
+                /// The per-file processed node does not exist yet.
+                /// Watch for its creation (NodeCreated event).
+                zk->existsWatch(processed_node_path, nullptr, event);
+            }
+
+            /// Watch the failed node for creation regardless of mode.
+            zk->existsWatch(failed_node_path, nullptr, event);
+        }
+
+        /// Wait for a Keeper notification.  The timeout guards against silent
+        /// watch loss on ZooKeeper session reconnect.
+        constexpr UInt64 watch_timeout_ms = 1000;
+        event->tryWait(watch_timeout_ms);
+    }
 }
 
 }

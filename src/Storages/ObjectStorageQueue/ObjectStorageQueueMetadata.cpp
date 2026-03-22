@@ -226,6 +226,94 @@ void ObjectStorageQueueMetadata::shutdown()
         update_registry_thread->join();
 }
 
+ObjectStorageQueueMetadata::PathState ObjectStorageQueueMetadata::getPathState(
+    const std::string & path,
+    std::string & failure_message) const
+{
+    auto component_guard = Coordination::setCurrentComponent("ObjectStorageQueueMetadata::getPathState");
+    const auto node_name = ObjectStorageQueueIFileMetadata::getNodeName(path);
+    const auto failed_node_path = (zookeeper_path / "failed" / node_name).string();
+
+    if (mode == ObjectStorageQueueMode::ORDERED)
+    {
+        /// For ordered mode, the processed state is tracked as the last processed file
+        /// in a shared node (per-bucket or global). A file is processed when
+        /// last_processed_path >= file_path (lexicographic comparison, which matches
+        /// the listing order S3Queue relies on).
+
+        /// Determine the correct processed node path for this file's bucket.
+        const size_t effective_buckets = useBucketsForProcessing() ? buckets_num : 1;
+        const auto bucket = ObjectStorageQueueOrderedFileMetadata::getBucketForPath(
+            path, effective_buckets, bucketing_mode, partitioning_mode, filename_parser.get());
+        const auto processed_node_path = useBucketsForProcessing()
+            ? (zookeeper_path / "buckets" / toString(bucket) / "processed").string()
+            : (zookeeper_path / "processed").string();
+
+        std::string processed_data;
+        std::string failed_data;
+        bool processed_node_exists = false;
+        bool failed_node_exists = false;
+
+        getKeeperRetriesControl(log).retryLoop([&]
+        {
+            auto zk = getZooKeeper();
+            auto responses = zk->tryGet({processed_node_path, failed_node_path});
+            processed_node_exists = (responses[0].error == Coordination::Error::ZOK);
+            if (processed_node_exists)
+                processed_data = responses[0].data;
+            failed_node_exists = (responses[1].error == Coordination::Error::ZOK);
+            if (failed_node_exists)
+                failed_data = responses[1].data;
+        });
+
+        if (failed_node_exists)
+        {
+            if (!failed_data.empty())
+                failure_message = ObjectStorageQueueIFileMetadata::NodeMetadata::fromString(failed_data).last_exception;
+            return PathState::Failed;
+        }
+
+        if (processed_node_exists && !processed_data.empty())
+        {
+            const auto node_metadata = ObjectStorageQueueIFileMetadata::NodeMetadata::fromString(processed_data);
+            if (!node_metadata.file_path.empty() && path <= node_metadata.file_path)
+                return PathState::Processed;
+        }
+    }
+    else
+    {
+        /// For unordered mode each processed/failed file gets its own dedicated node.
+        const auto processed_node_path = (zookeeper_path / "processed" / node_name).string();
+
+        std::string processed_data;
+        std::string failed_data;
+        bool processed_node_exists = false;
+        bool failed_node_exists = false;
+
+        getKeeperRetriesControl(log).retryLoop([&]
+        {
+            auto zk = getZooKeeper();
+            auto responses = zk->tryGet({processed_node_path, failed_node_path});
+            processed_node_exists = (responses[0].error == Coordination::Error::ZOK);
+            failed_node_exists = (responses[1].error == Coordination::Error::ZOK);
+            if (failed_node_exists)
+                failed_data = responses[1].data;
+        });
+
+        if (processed_node_exists)
+            return PathState::Processed;
+
+        if (failed_node_exists)
+        {
+            if (!failed_data.empty())
+                failure_message = ObjectStorageQueueIFileMetadata::NodeMetadata::fromString(failed_data).last_exception;
+            return PathState::Failed;
+        }
+    }
+
+    return PathState::Unknown;
+}
+
 ObjectStorageQueueMetadata::FileMetadataPtr ObjectStorageQueueMetadata::getFileMetadata(
     const std::string & path,
     ObjectStorageQueueOrderedFileMetadata::BucketInfoPtr bucket_info)

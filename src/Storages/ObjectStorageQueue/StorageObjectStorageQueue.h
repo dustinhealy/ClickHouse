@@ -66,6 +66,11 @@ public:
 
     ObjectStorageQueueSettings getSettings() const;
 
+    /// Block until `path` is marked as processed or failed in Keeper by this queue.
+    /// Throws if the path fails to be processed, if the table is being dropped,
+    /// or if the query is cancelled.
+    void waitForPathToBeProcessed(const std::string & path, ContextPtr local_context) const;
+
     /// Can setting be changed via ALTER TABLE MODIFY SETTING query.
     static bool isSettingChangeable(const std::string & name, ObjectStorageQueueMode mode);
 
