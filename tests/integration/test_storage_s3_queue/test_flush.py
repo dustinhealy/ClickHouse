@@ -8,6 +8,12 @@ Blocking is proven deterministically by using the `object_storage_queue_fail_com
 failpoint: while the failpoint is active the background worker can never write a
 `Processed` node in Keeper, so FLUSH cannot return.  The moment the failpoint is
 disabled the next commit succeeds and FLUSH unblocks.
+
+Ordered-mode semantics note: ordered queues track a monotonic "last processed"
+pointer rather than per-file markers.  FLUSH therefore returns as soon as the
+pointer has advanced past the requested path — not necessarily because that exact
+file was read.  `test_flush_ordered_semantics_advances_past_path` documents and
+pins this behaviour explicitly.
 """
 
 import logging
@@ -27,6 +33,10 @@ from helpers.s3_queue_common import (
 
 AVAILABLE_MODES = ["unordered", "ordered"]
 
+
+# ---------------------------------------------------------------------------
+# Cluster fixture
+# ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
 def s3_queue_setup_teardown(started_cluster):
@@ -60,6 +70,10 @@ def started_cluster():
         cluster.shutdown()
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def _run_flush_in_thread(node, table_name, file_path):
     """Start FLUSH in a daemon thread; return (thread, done_event, error_list)."""
     done = threading.Event()
@@ -81,11 +95,31 @@ def _run_flush_in_thread(node, table_name, file_path):
     return t, done, errors
 
 
+def _wait_for_flush_running(node, table_name, timeout_s=10):
+    """
+    Poll system.processes until the FLUSH query for `table_name` is visible.
+    This is a deterministic signal that the query has reached the server and
+    registered its Keeper watches — unlike a fixed sleep it does not depend on
+    timing.
+    """
+    for _ in range(timeout_s * 10):
+        count = int(node.query(
+            f"SELECT count() FROM system.processes "
+            f"WHERE query LIKE '%FLUSH OBJECT STORAGE QUEUE%{table_name}%'"
+        ))
+        if count > 0:
+            return
+        time.sleep(0.1)
+    raise AssertionError(
+        f"FLUSH for {table_name} did not appear in system.processes within {timeout_s} s"
+    )
+
+
 def _wait_for_commit_failure(node, table_name, timeout_s=60):
     """
     Spin until the background thread has hit `fail_commit` at least once.
-    This is the signal that the worker has the file, has inserted the data,
-    and is now stuck trying (and failing) to write the `Processed` node to Keeper.
+    The log message proves the worker has the file, has inserted the data,
+    and is now stuck failing to write the `Processed` node to Keeper.
     """
     msg = (
         f"StorageS3Queue (default.{table_name}): Failed to process data:"
@@ -100,13 +134,21 @@ def _wait_for_commit_failure(node, table_name, timeout_s=60):
     )
 
 
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
 @pytest.mark.parametrize("mode", AVAILABLE_MODES)
 def test_flush_blocks_until_commit_succeeds(started_cluster, mode):
     """
-    Use `object_storage_queue_fail_commit` to pin the background worker in a
-    permanent retry loop.  While the failpoint is active the file can never
-    reach `Processed` state, so FLUSH must block.  Once the failpoint is
-    disabled the commit succeeds and FLUSH must unblock.
+    The `object_storage_queue_fail_commit` failpoint pins the background worker
+    in a permanent retry loop — the file can never reach `Processed` state while
+    the failpoint is active.  FLUSH must therefore block for as long as the
+    failpoint is enabled, and unblock as soon as the commit is allowed to proceed.
+
+    The assertion that FLUSH is blocking is made after `system.processes` confirms
+    the query is running on the server, which is a deterministic signal that the
+    Keeper watches have been registered.
     """
     node = started_cluster.instances["instance"]
     table_name = f"flush_block_{mode}_{generate_random_string()}"
@@ -130,17 +172,18 @@ def test_flush_blocks_until_commit_succeeds(started_cluster, mode):
         create_mv(node, table_name, dst_table_name)
 
         # Wait until the background thread has hit the failpoint at least once.
-        # The file is now stuck in the "picked up but cannot commit" cycle.
+        # This proves the worker has the file but cannot commit it.
         _wait_for_commit_failure(node, table_name)
 
         # Start FLUSH while the failpoint is still active.
         t, flush_done, flush_errors = _run_flush_in_thread(node, table_name, file_path)
 
-        # Allow the FLUSH query to reach the server and register its Keeper
-        # watches.  After this sleep the file is still unprocessable (fail_commit
-        # is active), so done must still be unset.
-        time.sleep(1.0)
+        # Wait until the FLUSH query is visible in system.processes — this confirms
+        # the query is running on the server and its Keeper watches are registered.
+        _wait_for_flush_running(node, table_name)
 
+        # fail_commit is still active so the file cannot be committed; FLUSH must
+        # be blocking at this point.
         assert not flush_done.is_set(), (
             "FLUSH returned while fail_commit was still active — it did not block"
         )
@@ -156,8 +199,8 @@ def test_flush_blocks_until_commit_succeeds(started_cluster, mode):
     if flush_errors:
         raise flush_errors[0]
 
-    # The file was reinserted on every failed retry, so the count may exceed
-    # row_num; we only assert that at least one successful processing occurred.
+    # The file was reinserted on every failed retry, so count may exceed row_num;
+    # we only assert that at least one successful processing cycle occurred.
     count = int(node.query(f"SELECT count() FROM {dst_table_name}"))
     assert count > 0, f"Expected rows in destination table after flush, got 0"
 
@@ -219,8 +262,7 @@ def test_flush_raises_on_failed_path(started_cluster, mode):
     file_path = f"{files_path}/bad.csv"
 
     # Upload a file whose first column cannot be parsed as UInt32.
-    bad_csv = b"not_a_number,1,2\n"
-    put_s3_file_content(started_cluster, file_path, bad_csv)
+    put_s3_file_content(started_cluster, file_path, b"not_a_number,1,2\n")
 
     create_table(
         started_cluster,
@@ -239,8 +281,7 @@ def test_flush_raises_on_failed_path(started_cluster, mode):
     zk = started_cluster.get_kazoo_client("zoo1")
     for _ in range(60):
         try:
-            failed_nodes = zk.get_children(f"{keeper_path}/failed/")
-            if failed_nodes:
+            if zk.get_children(f"{keeper_path}/failed/"):
                 break
         except Exception:
             pass
@@ -248,7 +289,6 @@ def test_flush_raises_on_failed_path(started_cluster, mode):
     else:
         raise AssertionError("File was not marked as failed within 60 s")
 
-    # FLUSH must raise rather than hang.
     error = node.query_and_get_error(
         f"SYSTEM FLUSH OBJECT STORAGE QUEUE default.{table_name} PATH '{file_path}'"
     )
@@ -262,8 +302,8 @@ def test_flush_ordered_with_buckets(started_cluster):
     """
     FLUSH must work correctly for ordered-mode queues that use multiple buckets.
     Each bucket has its own processed pointer and the watch must land on the right
-    per-bucket node.  `object_storage_queue_fail_commit` is used so that FLUSH is
-    guaranteed to be blocking when the assertion is made.
+    per-bucket node.  `object_storage_queue_fail_commit` pins the worker so FLUSH
+    is guaranteed to be blocking when the assertion is made.
     """
     node = started_cluster.instances["instance"]
     table_name = f"flush_buckets_{generate_random_string()}"
@@ -292,7 +332,7 @@ def test_flush_ordered_with_buckets(started_cluster):
         _wait_for_commit_failure(node, table_name)
 
         t, flush_done, flush_errors = _run_flush_in_thread(node, table_name, file_path)
-        time.sleep(1.0)
+        _wait_for_flush_running(node, table_name)
 
         assert not flush_done.is_set(), (
             "FLUSH returned while fail_commit was still active — it did not block"
@@ -310,3 +350,119 @@ def test_flush_ordered_with_buckets(started_cluster):
 
     count = int(node.query(f"SELECT count() FROM {dst_table_name}"))
     assert count > 0, f"Expected rows in destination table after flush, got 0"
+
+
+def test_flush_ordered_semantics_advances_past_path(started_cluster):
+    """
+    In ordered mode FLUSH returns as soon as the queue pointer has advanced past
+    `path`, not necessarily because `path` was explicitly processed.  A path that
+    sorts lexicographically before the current last-processed path returns
+    immediately even if it was never uploaded.
+
+    This test documents and pins that semantic: it uploads `test_0.csv`, waits for
+    it to be naturally processed, then calls FLUSH for `aaa.csv` (which sorts
+    before `test_0.csv` and was never uploaded).  FLUSH must return immediately.
+    """
+    node = started_cluster.instances["instance"]
+    table_name = f"flush_semantics_{generate_random_string()}"
+    dst_table_name = f"{table_name}_dst"
+    files_path = f"{table_name}_data"
+    keeper_path = f"/clickhouse/test_{table_name}"
+
+    # test_0.csv sorts after aaa.csv, so processing it advances the pointer past aaa.csv.
+    generate_random_files(started_cluster, files_path, count=1, row_num=3)
+    file_path_earlier = f"{files_path}/aaa.csv"   # never uploaded, sorts before test_0.csv
+
+    create_table(
+        started_cluster,
+        node,
+        table_name,
+        "ordered",
+        files_path,
+        additional_settings={"keeper_path": keeper_path},
+    )
+    create_mv(node, table_name, dst_table_name)
+
+    # Wait for the uploaded file to be processed naturally.
+    for _ in range(60):
+        if int(node.query(f"SELECT count() FROM {dst_table_name}")) == 3:
+            break
+        time.sleep(1)
+    else:
+        raise AssertionError("File was not processed within 60 s")
+
+    # FLUSH for the path that sorts before the pointer must return immediately.
+    deadline = time.monotonic() + 5.0
+    node.query(
+        f"SYSTEM FLUSH OBJECT STORAGE QUEUE default.{table_name}"
+        f" PATH '{file_path_earlier}'"
+    )
+    assert time.monotonic() < deadline, (
+        "FLUSH for a path below the ordered pointer should return immediately "
+        "(ordered-mode semantics: 'advanced past', not 'exact match')"
+    )
+
+
+def test_flush_ordered_with_hive_partitioning(started_cluster):
+    """
+    FLUSH must be watch-driven in ordered mode with HIVE partitioning.
+
+    In the HIVE/REGEX partitioned case the `Processed` marker lives under
+    `processed/<partition_key>`, not the parent `processed/` node.  A ZooKeeper
+    watch on a parent does NOT fire when a child is created or modified, so FLUSH
+    must watch the child directly.
+
+    This test verifies that the watch is placed on the correct node by using
+    `fail_commit` to pin the worker, confirming FLUSH blocks, then releasing and
+    confirming FLUSH unblocks.
+    """
+    node = started_cluster.instances["instance"]
+    table_name = f"flush_hive_{generate_random_string()}"
+    dst_table_name = f"{table_name}_dst"
+    files_path = f"{table_name}_data"
+    keeper_path = f"/clickhouse/test_{table_name}"
+    partition_subpath = "date=2021-01-01/city=NYC"
+    file_path = f"{files_path}/{partition_subpath}/test_0.csv"
+
+    put_s3_file_content(
+        started_cluster,
+        file_path,
+        b"1,2,3\n4,5,6\n7,8,9\n",
+    )
+
+    node.query("SYSTEM ENABLE FAILPOINT object_storage_queue_fail_commit")
+    try:
+        create_table(
+            started_cluster,
+            node,
+            table_name,
+            "ordered",
+            files_path,
+            hive_partitioning_path=f"{partition_subpath}/",
+            hive_partitioning_columns="date Date, city String",
+            additional_settings={"keeper_path": keeper_path},
+        )
+        create_mv(node, table_name, dst_table_name, virtual_columns="date Date, city String")
+
+        _wait_for_commit_failure(node, table_name)
+
+        t, flush_done, flush_errors = _run_flush_in_thread(node, table_name, file_path)
+        _wait_for_flush_running(node, table_name)
+
+        assert not flush_done.is_set(), (
+            "FLUSH returned while fail_commit was still active — it did not block"
+        )
+    finally:
+        node.query("SYSTEM DISABLE FAILPOINT object_storage_queue_fail_commit")
+
+    assert flush_done.wait(timeout=120), (
+        "FLUSH (HIVE partitioned) did not unblock within 120 s after disabling fail_commit"
+    )
+    t.join()
+
+    if flush_errors:
+        raise flush_errors[0]
+
+    count = int(node.query(f"SELECT count() FROM {dst_table_name}"))
+    assert count > 0, f"Expected rows in destination table after flush, got 0"
+

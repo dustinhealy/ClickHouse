@@ -66,9 +66,18 @@ public:
 
     ObjectStorageQueueSettings getSettings() const;
 
-    /// Block until `path` is marked as processed or failed in Keeper by this queue.
-    /// Throws if the path fails to be processed, if the table is being dropped,
-    /// or if the query is cancelled.
+    /// Block until `path` is marked as processed (or failed) in Keeper by this queue,
+    /// then return.
+    ///
+    /// NOTE — ordered mode semantics: ordered queues track a monotonic "last processed"
+    /// pointer rather than per-file markers.  This command therefore returns as soon as
+    /// the queue pointer has advanced past `path`, not necessarily because `path` was
+    /// explicitly read.  A path that sorts lexicographically before the current pointer
+    /// will return immediately even if it was never uploaded.
+    ///
+    /// Throws ABORTED if the path failed to be processed, QUERY_WAS_CANCELLED if the
+    /// table is dropped or the query is killed, and BAD_ARGUMENTS if the background
+    /// streaming thread is not running or will never make progress.
     void waitForPathToBeProcessed(const std::string & path, ContextPtr local_context) const;
 
     /// Can setting be changed via ALTER TABLE MODIFY SETTING query.
