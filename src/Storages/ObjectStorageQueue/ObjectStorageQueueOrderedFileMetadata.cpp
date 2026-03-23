@@ -308,6 +308,7 @@ ObjectStorageQueueOrderedFileMetadata::ObjectStorageQueueOrderedFileMetadata(
         /* processing_node_path */zk_path_ / "processing" / getNodeName(path_),
         /* processed_node_path */getProcessedPath(zk_path_, path_, buckets_num_, bucketing_mode_, partitioning_mode_, parser_),
         /* failed_node_path */zk_path_ / "failed" / getNodeName(path_),
+        /* flush_status_node_path */zk_path_ / "flush_status" / getNodeName(path_),
         file_status_,
         max_loading_retries_,
         metadata_ref_count_,
@@ -334,14 +335,14 @@ std::vector<std::string> ObjectStorageQueueOrderedFileMetadata::getMetadataPaths
 {
     if (DB::useBucketsForProcessing(buckets_num))
     {
-        std::vector<std::string> paths{"buckets", "failed", "processing", "persistent_processing"};
+        std::vector<std::string> paths{"buckets", "failed", "processing", "persistent_processing", "flush_status"};
         for (size_t i = 0; i < buckets_num; ++i)
             paths.push_back("buckets/" + toString(i));
         return paths;
     }
     /// We do not return "processed" node here,
     /// because we do not want it to be created in advance.
-    return {"failed", "processing", "persistent_processing"};
+    return {"failed", "processing", "persistent_processing", "flush_status"};
 }
 
 bool ObjectStorageQueueOrderedFileMetadata::getMaxProcessedNode(
@@ -808,7 +809,13 @@ void ObjectStorageQueueOrderedFileMetadata::doPrepareProcessedRequests(
     }
 
     if (created_processing_node)
+    {
         requests.push_back(zkutil::makeRemoveRequest(processing_node_path, -1));
+        /// Write exact per-file terminal status for FLUSH to watch.
+        requests.push_back(
+            zkutil::makeCreateRequest(
+                flush_status_node_path, node_metadata.toString(), zkutil::CreateMode::Persistent));
+    }
 }
 
 void ObjectStorageQueueOrderedFileMetadata::prepareProcessedRequestsImpl(

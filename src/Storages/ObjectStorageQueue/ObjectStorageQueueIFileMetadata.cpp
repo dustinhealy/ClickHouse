@@ -129,6 +129,7 @@ ObjectStorageQueueIFileMetadata::ObjectStorageQueueIFileMetadata(
     const std::string & processing_node_path_,
     const std::string & processed_node_path_,
     const std::string & failed_node_path_,
+    const std::string & flush_status_node_path_,
     FileStatusPtr file_status_,
     size_t max_loading_retries_,
     std::atomic<size_t> & metadata_ref_count_,
@@ -144,6 +145,7 @@ ObjectStorageQueueIFileMetadata::ObjectStorageQueueIFileMetadata(
     , processing_node_path(processing_node_path_)
     , processed_node_path(processed_node_path_)
     , failed_node_path(failed_node_path_)
+    , flush_status_node_path(flush_status_node_path_)
     , node_metadata(createNodeMetadata(path))
     , log(log_)
 {
@@ -584,8 +586,10 @@ void ObjectStorageQueueIFileMetadata::prepareFailedRequestsImpl(
 
         /// Remove Processing node.
         requests.push_back(zkutil::makeRemoveRequest(processing_node_path, -1));
-        /// Created Failed node.
+        /// Create Failed node.
         requests.push_back(zkutil::makeCreateRequest(failed_node_path, node_metadata.toString(), zkutil::CreateMode::Persistent));
+        /// Write exact per-file terminal status for FLUSH to watch.
+        requests.push_back(zkutil::makeCreateRequest(flush_status_node_path, node_metadata.toString(), zkutil::CreateMode::Persistent));
         return;
     }
 
@@ -626,6 +630,8 @@ void ObjectStorageQueueIFileMetadata::prepareFailedRequestsImpl(
         requests.push_back(zkutil::makeRemoveRequest(retrieable_failed_node_path, retriable_failed_node_stat.version));
         /// Create a persistent node /failed/node_hash.
         requests.push_back(zkutil::makeCreateRequest(failed_node_path, node_metadata.toString(), zkutil::CreateMode::Persistent));
+        /// Write exact per-file terminal status for FLUSH to watch.
+        requests.push_back(zkutil::makeCreateRequest(flush_status_node_path, node_metadata.toString(), zkutil::CreateMode::Persistent));
     }
     else
     {

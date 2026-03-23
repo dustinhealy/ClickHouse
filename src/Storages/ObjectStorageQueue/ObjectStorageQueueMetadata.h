@@ -120,6 +120,11 @@ public:
         Failed,
         /// The path has not been processed yet.
         Unknown,
+        /// Ordered mode only: the queue pointer has advanced past this path's sort
+        /// position but no exact flush_status node exists for it (e.g. the file was
+        /// processed before the flush_status feature was introduced, or the path was
+        /// never uploaded).  FLUSH treats this as success for backward compatibility.
+        AdvancedWithoutExactStatus,
     };
 
     /// Check Keeper to determine whether `path` has already been processed or failed.
@@ -130,6 +135,9 @@ public:
     ///       it means the queue pointer has advanced past the file's sort position.
     /// Sets `failure_message` when the result is `Failed`.
     PathState getPathState(const std::string & path, std::string & failure_message) const;
+
+    /// Return the Keeper path of the per-file flush_status node for `path`.
+    std::string getFlushStatusNodePath(const std::string & path) const;
 
     /// Get object storage type: s3, azure, local, etc.
     ObjectStorageType getType() const { return storage_type; }

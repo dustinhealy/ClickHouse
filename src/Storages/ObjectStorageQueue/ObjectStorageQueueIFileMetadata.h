@@ -99,6 +99,7 @@ public:
         const std::string & processing_node_path_,
         const std::string & processed_node_path_,
         const std::string & failed_node_path_,
+        const std::string & flush_status_node_path_,
         FileStatusPtr file_status_,
         size_t max_loading_retries_,
         std::atomic<size_t> & metadata_ref_count_,
@@ -208,6 +209,7 @@ protected:
     const std::string processing_node_path;
     const std::string processed_node_path;
     const std::string failed_node_path;
+    const std::string flush_status_node_path;
 
     NodeMetadata node_metadata;
     LoggerPtr log;

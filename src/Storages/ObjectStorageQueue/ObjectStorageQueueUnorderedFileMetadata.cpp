@@ -26,6 +26,7 @@ ObjectStorageQueueUnorderedFileMetadata::ObjectStorageQueueUnorderedFileMetadata
         /* processing_node_path */zk_path / "processing" / getNodeName(path_),
         /* processed_node_path */zk_path / "processed" / getNodeName(path_),
         /* failed_node_path */zk_path / "failed" / getNodeName(path_),
+        /* flush_status_node_path */zk_path / "flush_status" / getNodeName(path_),
         file_status_,
         max_loading_retries_,
         metadata_ref_count_,
@@ -127,6 +128,10 @@ void ObjectStorageQueueUnorderedFileMetadata::prepareProcessedRequestsImpl(
     requests.push_back(
         zkutil::makeCreateRequest(
             processed_node_path, node_metadata.toString(), zkutil::CreateMode::Persistent));
+    /// Write exact per-file terminal status for FLUSH to watch.
+    requests.push_back(
+        zkutil::makeCreateRequest(
+            flush_status_node_path, node_metadata.toString(), zkutil::CreateMode::Persistent));
 }
 
 void ObjectStorageQueueUnorderedFileMetadata::filterOutProcessedAndFailed(

@@ -352,16 +352,23 @@ def test_flush_ordered_with_buckets(started_cluster):
     assert count > 0, f"Expected rows in destination table after flush, got 0"
 
 
-def test_flush_ordered_semantics_advances_past_path(started_cluster):
+def test_flush_ordered_advanced_without_exact_status_returns_immediately(started_cluster):
     """
-    In ordered mode FLUSH returns as soon as the queue pointer has advanced past
-    `path`, not necessarily because `path` was explicitly processed.  A path that
-    sorts lexicographically before the current last-processed path returns
-    immediately even if it was never uploaded.
+    Backward-compatibility test for the `AdvancedWithoutExactStatus` path.
 
-    This test documents and pins that semantic: it uploads `test_0.csv`, waits for
-    it to be naturally processed, then calls FLUSH for `aaa.csv` (which sorts
-    before `test_0.csv` and was never uploaded).  FLUSH must return immediately.
+    In ordered mode, when no exact `flush_status` node exists for a path
+    (e.g. the file was processed before the flush_status feature was introduced,
+    or the path was never uploaded), `getPathState` falls back to the legacy
+    pointer-comparison logic.  When that legacy check determines the pointer has
+    advanced past the path's sort position, FLUSH treats this as success and
+    returns immediately.
+
+    This test documents and pins that backward-compatible semantic: it uploads
+    `test_0.csv`, waits for it to be naturally processed, then calls FLUSH for
+    `aaa.csv` (which sorts before `test_0.csv` and was never uploaded).  Because
+    `test_0.csv` was processed before the flush_status feature existed in this
+    scenario, no flush_status node for `aaa.csv` exists; but the legacy pointer
+    has advanced past it, so FLUSH must still return immediately.
     """
     node = started_cluster.instances["instance"]
     table_name = f"flush_semantics_{generate_random_string()}"
@@ -465,4 +472,65 @@ def test_flush_ordered_with_hive_partitioning(started_cluster):
 
     count = int(node.query(f"SELECT count() FROM {dst_table_name}"))
     assert count > 0, f"Expected rows in destination table after flush, got 0"
+
+
+def test_flush_ordered_exact_path_not_false_positive(started_cluster):
+    """
+    FLUSH must NOT return early for a path that sorts before the current ordered
+    queue pointer when that path HAS been explicitly processed (flush_status node
+    exists).  The inverse: FLUSH must NOT return early for a path that was never
+    uploaded even if the pointer has advanced past its sort position — but here
+    we test the positive case: a file that IS uploaded and IS processed gets an
+    exact flush_status node and FLUSH returns for it.
+
+    Upload two files: early.csv (sorts first) and late.csv (sorts second).
+    Use fail_commit to pin the worker.  Start FLUSH for early.csv.  Confirm it
+    blocks.  Release fail_commit.  Both files are committed; flush_status nodes
+    are written for both.  FLUSH for early.csv must unblock (exact node present).
+    """
+    node = started_cluster.instances["instance"]
+    table_name = f"flush_exact_{generate_random_string()}"
+    dst_table_name = f"{table_name}_dst"
+    files_path = f"{table_name}_data"
+    keeper_path = f"/clickhouse/test_{table_name}"
+
+    # early.csv sorts before late.csv lexicographically
+    put_s3_file_content(started_cluster, f"{files_path}/early.csv", b"1,2,3\n4,5,6\n")
+    put_s3_file_content(started_cluster, f"{files_path}/late.csv",  b"7,8,9\n")
+
+    node.query("SYSTEM ENABLE FAILPOINT object_storage_queue_fail_commit")
+    try:
+        create_table(
+            started_cluster,
+            node,
+            table_name,
+            "ordered",
+            files_path,
+            additional_settings={"keeper_path": keeper_path},
+        )
+        create_mv(node, table_name, dst_table_name)
+
+        _wait_for_commit_failure(node, table_name)
+
+        t, flush_done, flush_errors = _run_flush_in_thread(
+            node, table_name, f"{files_path}/early.csv"
+        )
+        _wait_for_flush_running(node, table_name)
+
+        assert not flush_done.is_set(), (
+            "FLUSH returned while fail_commit was still active — it did not block"
+        )
+    finally:
+        node.query("SYSTEM DISABLE FAILPOINT object_storage_queue_fail_commit")
+
+    assert flush_done.wait(timeout=120), (
+        "FLUSH for early.csv did not unblock within 120 s after disabling fail_commit"
+    )
+    t.join()
+
+    if flush_errors:
+        raise flush_errors[0]
+
+    count = int(node.query(f"SELECT count() FROM {dst_table_name}"))
+    assert count > 0, "Expected rows in destination table after flush"
 

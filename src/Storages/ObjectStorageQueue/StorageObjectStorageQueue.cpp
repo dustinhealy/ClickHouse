@@ -1739,48 +1739,7 @@ void StorageObjectStorageQueue::waitForPathToBeProcessed(
             "Cannot wait for path to be processed: streaming is disabled for {}",
             getStorageID().getNameForLogs());
 
-    const auto node_name = ObjectStorageQueueIFileMetadata::getNodeName(path);
-
-    /// Determine the Keeper paths we need to watch.
-    /// For unordered mode each file gets its own node under processed/ and failed/.
-    /// For ordered mode the processed pointer is a shared node whose *data* is updated,
-    /// while the failed node is still per-file.
-    const bool is_ordered = files_metadata->getTableMetadata().getMode() == ObjectStorageQueueMode::ORDERED;
-    const bool uses_buckets = files_metadata->useBucketsForProcessing();
-
-    std::string processed_node_path;
-    if (is_ordered)
-    {
-        const size_t effective_buckets = uses_buckets ? files_metadata->getBucketsNum() : 1;
-        const auto bucket = ObjectStorageQueueOrderedFileMetadata::getBucketForPath(
-            path,
-            effective_buckets,
-            files_metadata->getBucketingMode(),
-            files_metadata->getPartitioningMode(),
-            files_metadata->getFilenameParser());
-        processed_node_path = uses_buckets
-            ? (zk_path / "buckets" / toString(bucket) / "processed").string()
-            : (zk_path / "processed").string();
-    }
-    else
-    {
-        processed_node_path = (zk_path / "processed" / node_name).string();
-    }
-
-    const auto failed_node_path = (zk_path / "failed" / node_name).string();
-
-    /// For ordered mode with HIVE/REGEX partitioning the processed pointer is stored
-    /// under a partition-specific child of the processed node, not in the node itself.
-    /// A watch on a parent node does NOT fire when a child is created or modified,
-    /// so we must watch the child directly.
-    std::string effective_processed_watch_path = processed_node_path;
-    if (is_ordered)
-    {
-        const auto partition_key = ObjectStorageQueueOrderedFileMetadata::getPartitionKey(
-            path, files_metadata->getPartitioningMode(), files_metadata->getFilenameParser());
-        if (!partition_key.empty())
-            effective_processed_watch_path = (fs::path(processed_node_path) / partition_key).string();
-    }
+    const auto flush_status_node_path = files_metadata->getFlushStatusNodePath(path);
 
     LOG_DEBUG(log, "Waiting for path '{}' to be processed by {}", path, getStorageID().getNameForLogs());
 
@@ -1816,34 +1775,15 @@ void StorageObjectStorageQueue::waitForPathToBeProcessed(
         /// Any transition that occurred before step 1 will be observed in step 2.
         if (need_arm)
         {
-            /// Wrap watch registration in the standard Keeper retry loop so that
-            /// transient session errors are retried rather than propagated to the caller.
             ObjectStorageQueueMetadata::getKeeperRetriesControl(log).retryLoop([&]
             {
-                /// Watches require the raw ZooKeeper client because
-                /// ZooKeeperWithFaultInjection does not expose the watch API.
                 auto zk = files_metadata->getZooKeeper()->getKeeper();
-
-                if (is_ordered)
-                {
-                    /// The ordered processed pointer may or may not exist yet:
-                    /// - Exists   → tryGetWatch registers a NodeDataChanged watch.
-                    /// - Missing  → tryGetWatch returns false without registering; fall back to
-                    ///              existsWatch so we are notified when the node is first created.
-                    std::string dummy_data;
-                    Coordination::Stat dummy_stat{};
-                    const bool node_exists = zk->tryGetWatch(effective_processed_watch_path, dummy_data, &dummy_stat, event);
-                    if (!node_exists)
-                        zk->existsWatch(effective_processed_watch_path, nullptr, event);
-                }
-                else
-                {
-                    /// Unordered: each file gets its own processed node; watch for its creation.
-                    zk->existsWatch(processed_node_path, nullptr, event);
-                }
-
-                /// Per-file failed node: watch for creation regardless of mode.
-                zk->existsWatch(failed_node_path, nullptr, event);
+                /// Watch the exact per-file flush_status node.  It is created atomically
+                /// with the final success or failure commit, so a single watch covers both
+                /// outcomes.  For files committed before the flush_status feature existed
+                /// (backward compat), getPathState falls back to old nodes and we detect
+                /// the transition on the next 1-second poll tick.
+                zk->existsWatch(flush_status_node_path, nullptr, event);
             });
             need_arm = false;
         }
@@ -1852,7 +1792,8 @@ void StorageObjectStorageQueue::waitForPathToBeProcessed(
         std::string failure_message;
         const auto state = files_metadata->getPathState(path, failure_message);
 
-        if (state == ObjectStorageQueueMetadata::PathState::Processed)
+        if (state == ObjectStorageQueueMetadata::PathState::Processed
+            || state == ObjectStorageQueueMetadata::PathState::AdvancedWithoutExactStatus)
         {
             LOG_DEBUG(log, "Path '{}' has been processed by {}", path, getStorageID().getNameForLogs());
             return;
