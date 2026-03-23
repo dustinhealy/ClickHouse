@@ -136,6 +136,7 @@ namespace ObjectStorageQueueSetting
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
+    extern const int ABORTED;
     extern const int BAD_ARGUMENTS;
     extern const int BAD_QUERY_PARAMETER;
     extern const int QUERY_NOT_ALLOWED;
@@ -1717,6 +1718,26 @@ void StorageObjectStorageQueue::waitForPathToBeProcessed(
     ContextPtr local_context) const
 {
     auto component_guard = Coordination::setCurrentComponent("StorageObjectStorageQueue::waitForPathToBeProcessed");
+
+    /// Pre-flight: fail immediately for states in which the background thread will
+    /// never make progress, rather than parking the caller indefinitely.
+
+    /// Background tasks are created during startup(); if they haven't started yet
+    /// (or were never created) nothing will ever write the processed/failed nodes.
+    if (!startup_finished || streaming_tasks.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "Cannot wait for path to be processed: background streaming for {} "
+            "has not started yet",
+            getStorageID().getNameForLogs());
+
+    /// Without an attached materialized view the background thread skips every
+    /// poll cycle (threadFunc checks getDependencies() == 0 and reschedules).
+    if (getDependencies() == 0)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "Cannot wait for path to be processed: table {} has no attached "
+            "materialized views and will not consume any files",
+            getStorageID().getNameForLogs());
+
     const auto node_name = ObjectStorageQueueIFileMetadata::getNodeName(path);
 
     /// Determine the Keeper paths we need to watch.
@@ -1756,13 +1777,61 @@ void StorageObjectStorageQueue::waitForPathToBeProcessed(
                 "Table {} is being dropped or server is shutting down",
                 getStorageID().getNameForLogs());
 
-        if (auto query_status = local_context->getProcessListElementSafe())
-            query_status->throwIfKilled();
+        /// Respect max_execution_time and KILL QUERY: throws QUERY_WAS_CANCELLED
+        /// on manual kill or when the query's time budget is exhausted.
+        /// This is the only guard against indefinite waits for paths that will
+        /// never be seen by the background thread (e.g. typos, wrong prefixes).
+        if (auto * query_status = local_context->getProcessListElementSafe())
+            query_status->checkTimeLimit();
 
-        /// Check current state first, then arm watches.
-        /// The watch is set *after* the state check so we cannot miss a transition:
-        /// if the node appeared between the state check and the watch registration
-        /// the next iteration's state check will catch it immediately.
+        /// Correct watch-then-check ordering to eliminate the TOCTOU gap:
+        ///
+        ///   1. Arm watches first.
+        ///   2. Read state after the watches are in place.
+        ///   3. If done, return.  Otherwise wait for the event.
+        ///
+        /// Any transition that occurs after step 1 will fire the event.
+        /// Any transition that occurred before step 1 will be observed in step 2.
+        /// There is therefore no window in which a transition can be missed.
+        /// The timeout in step 3 is only a safety net for ZK session reconnects,
+        /// which silently drop all watches.
+
+        /// A fresh event per outer iteration.  All watches registered inside the
+        /// retry loop below share the same EventPtr so any one of them waking up
+        /// is sufficient to re-check state.
+        auto event = std::make_shared<Poco::Event>();
+
+        /// Wrap watch registration in the standard Keeper retry loop so that
+        /// transient session errors are retried rather than propagated to the caller.
+        ObjectStorageQueueMetadata::getKeeperRetriesControl(log).retryLoop([&]
+        {
+            /// Watches require the raw ZooKeeper client because
+            /// ZooKeeperWithFaultInjection does not expose the watch API.
+            auto zk = files_metadata->getZooKeeper()->getKeeper();
+
+            if (is_ordered)
+            {
+                /// The ordered processed pointer may or may not exist yet:
+                /// - Exists   → tryGetWatch registers a NodeDataChanged watch.
+                /// - Missing  → tryGetWatch returns false without registering; fall back to
+                ///              existsWatch so we are notified when the node is first created.
+                std::string dummy_data;
+                Coordination::Stat dummy_stat{};
+                const bool node_exists = zk->tryGetWatch(processed_node_path, dummy_data, &dummy_stat, event);
+                if (!node_exists)
+                    zk->existsWatch(processed_node_path, nullptr, event);
+            }
+            else
+            {
+                /// Unordered: each file gets its own processed node; watch for its creation.
+                zk->existsWatch(processed_node_path, nullptr, event);
+            }
+
+            /// Per-file failed node: watch for creation regardless of mode.
+            zk->existsWatch(failed_node_path, nullptr, event);
+        });
+
+        /// Read state now that every relevant watch is armed.
         std::string failure_message;
         const auto state = files_metadata->getPathState(path, failure_message);
 
@@ -1773,41 +1842,13 @@ void StorageObjectStorageQueue::waitForPathToBeProcessed(
         }
         if (state == ObjectStorageQueueMetadata::PathState::Failed)
         {
-            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            throw Exception(ErrorCodes::ABORTED,
                 "Path '{}' failed to be processed by {}: {}",
                 path, getStorageID().getNameForLogs(), failure_message);
         }
 
-        /// Not yet processed — arm watches so we wake up as soon as either node changes.
-        /// Watches are one-shot in Keeper, so we re-register them on each iteration.
-        /// We pass an EventPtr so both watches share the same event.
-        auto event = std::make_shared<Poco::Event>();
-        {
-            /// Watch operations require the raw ZooKeeper client because
-            /// ZooKeeperWithFaultInjection does not expose the watch API directly.
-            auto zk = files_metadata->getZooKeeper()->getKeeper();
-
-            if (is_ordered)
-            {
-                /// The processed node already exists (it stores the last-processed pointer).
-                /// Watch it for data changes (NodeDataChanged event).
-                std::string dummy_data;
-                Coordination::Stat dummy_stat{};
-                zk->tryGetWatch(processed_node_path, dummy_data, &dummy_stat, event);
-            }
-            else
-            {
-                /// The per-file processed node does not exist yet.
-                /// Watch for its creation (NodeCreated event).
-                zk->existsWatch(processed_node_path, nullptr, event);
-            }
-
-            /// Watch the failed node for creation regardless of mode.
-            zk->existsWatch(failed_node_path, nullptr, event);
-        }
-
-        /// Wait for a Keeper notification.  The timeout guards against silent
-        /// watch loss on ZooKeeper session reconnect.
+        /// State is still Unknown — block until a watch fires or the session-reconnect
+        /// timeout expires (at which point the next iteration re-arms the watches).
         constexpr UInt64 watch_timeout_ms = 1000;
         event->tryWait(watch_timeout_ms);
     }

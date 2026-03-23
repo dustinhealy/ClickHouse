@@ -77,6 +77,39 @@ public:
         size_t prev_value,
         const std::string & zookeeper_name_);
 
+    /// Derive the partition key for `path` under the configured partitioning mode.
+    /// Returns an empty string when partitioning is NONE or the key cannot be extracted.
+    static std::string getPartitionKey(
+        const std::string & path,
+        ObjectStorageQueuePartitioningMode partitioning_mode,
+        const ObjectStorageQueueFilenameParser * parser);
+
+    /// Represents the processed / failed state of a single file path as seen in Keeper.
+    struct ProcessingStateFromKeeper
+    {
+        explicit ProcessingStateFromKeeper(bool is_failed_) : is_failed(is_failed_) {}
+        ProcessingStateFromKeeper(const std::string & path, const std::string & last_processed_path_, bool is_failed_);
+
+        std::optional<std::string> last_processed_path = std::nullopt;
+        bool is_failed = false;
+        bool is_processed = false;
+        /// Populated from the failed node data when `is_failed` is true.
+        std::string failure_message;
+    };
+
+    /// Read the processed/failed state of `file_path` from Keeper without side-effects.
+    /// `processed_node_path_` is the global or per-bucket processed pointer node.
+    /// `processed_node_hive_partitioning_path` is the partition-specific sub-node (optional).
+    /// `failed_node_path_` is the per-file failed node (optional).
+    static ProcessingStateFromKeeper getProcessingStateFromKeeper(
+        Coordination::Stat * processed_node_stat,
+        const std::string & processed_node_path_,
+        const std::string & file_path,
+        std::optional<std::string> processed_node_hive_partitioning_path = std::nullopt,
+        std::optional<std::string> failed_node_path = std::nullopt,
+        LoggerPtr log_ = nullptr,
+        const std::string & zookeeper_name_ = {});
+
     /// Return vector of indexes of filtered paths.
     static void filterOutProcessedAndFailed(
         std::vector<std::string> & paths,
@@ -109,29 +142,10 @@ private:
         LoggerPtr log_,
         const std::string & zookeeper_name_);
 
-    struct ProcessingStateFromKeeper
-    {
-        explicit ProcessingStateFromKeeper(bool is_failed_) : is_failed(is_failed_) {}
-        ProcessingStateFromKeeper(const std::string & path, const std::string & last_processed_path_, bool is_failed_);
-
-        const std::optional<std::string> last_processed_path = std::nullopt;
-        const bool is_failed = false;
-        const bool is_processed = false;
-    };
-
     ProcessingStateFromKeeper getProcessingStateFromKeeper(
         Coordination::Stat * processed_node_stat,
         bool check_failed = false,
         LoggerPtr log_ = nullptr);
-
-    static ProcessingStateFromKeeper getProcessingStateFromKeeper(
-        Coordination::Stat * processed_node_stat,
-        const std::string & processed_node_path_,
-        const std::string & file_path,
-        std::optional<std::string> processed_node_hive_partitioning_path = std::nullopt,
-        std::optional<std::string> failed_node_path = std::nullopt,
-        LoggerPtr log_ = nullptr,
-        const std::string & zookeeper_name_ = {});
 
     static bool getMaxProcessedFilesByHivePartition(
         std::unordered_map<std::string, std::string> & last_processed_path_per_hive_partition,

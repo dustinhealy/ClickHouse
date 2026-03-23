@@ -47,6 +47,7 @@ namespace ErrorCodes
     extern const int REPLICA_ALREADY_EXISTS;
     extern const int SUPPORT_IS_DISABLED;
     extern const int TIMEOUT_EXCEEDED;
+    extern const int UNEXPECTED_ZOOKEEPER_ERROR;
 }
 
 namespace Setting
@@ -236,12 +237,10 @@ ObjectStorageQueueMetadata::PathState ObjectStorageQueueMetadata::getPathState(
 
     if (mode == ObjectStorageQueueMode::ORDERED)
     {
-        /// For ordered mode, the processed state is tracked as the last processed file
-        /// in a shared node (per-bucket or global). A file is processed when
-        /// last_processed_path >= file_path (lexicographic comparison, which matches
-        /// the listing order S3Queue relies on).
+        /// Delegate to ObjectStorageQueueOrderedFileMetadata::getProcessingStateFromKeeper,
+        /// which handles all sub-cases: global vs per-bucket pointer, plain vs partitioned
+        /// (HIVE/REGEX), and proper Keeper safety checks.
 
-        /// Determine the correct processed node path for this file's bucket.
         const size_t effective_buckets = useBucketsForProcessing() ? buckets_num : 1;
         const auto bucket = ObjectStorageQueueOrderedFileMetadata::getBucketForPath(
             path, effective_buckets, bucketing_mode, partitioning_mode, filename_parser.get());
@@ -249,64 +248,65 @@ ObjectStorageQueueMetadata::PathState ObjectStorageQueueMetadata::getPathState(
             ? (zookeeper_path / "buckets" / toString(bucket) / "processed").string()
             : (zookeeper_path / "processed").string();
 
-        std::string processed_data;
-        std::string failed_data;
-        bool processed_node_exists = false;
-        bool failed_node_exists = false;
+        /// For HIVE/REGEX partitioned queues the "last processed" pointer is stored under
+        /// a partition-specific child of the processed node rather than in the node itself.
+        std::optional<std::string> partition_processed_path;
+        const auto partition_key = ObjectStorageQueueOrderedFileMetadata::getPartitionKey(
+            path, partitioning_mode, filename_parser.get());
+        if (!partition_key.empty())
+            partition_processed_path = (fs::path(processed_node_path) / partition_key).string();
 
-        getKeeperRetriesControl(log).retryLoop([&]
-        {
-            auto zk = getZooKeeper();
-            auto responses = zk->tryGet({processed_node_path, failed_node_path});
-            processed_node_exists = (responses[0].error == Coordination::Error::ZOK);
-            if (processed_node_exists)
-                processed_data = responses[0].data;
-            failed_node_exists = (responses[1].error == Coordination::Error::ZOK);
-            if (failed_node_exists)
-                failed_data = responses[1].data;
-        });
+        auto state = ObjectStorageQueueOrderedFileMetadata::getProcessingStateFromKeeper(
+            nullptr,
+            processed_node_path,
+            path,
+            partition_processed_path,
+            failed_node_path,
+            log,
+            zookeeper_name);
 
-        if (failed_node_exists)
+        if (state.is_failed)
         {
-            if (!failed_data.empty())
-                failure_message = ObjectStorageQueueIFileMetadata::NodeMetadata::fromString(failed_data).last_exception;
+            failure_message = state.failure_message;
             return PathState::Failed;
         }
-
-        if (processed_node_exists && !processed_data.empty())
-        {
-            const auto node_metadata = ObjectStorageQueueIFileMetadata::NodeMetadata::fromString(processed_data);
-            if (!node_metadata.file_path.empty() && path <= node_metadata.file_path)
-                return PathState::Processed;
-        }
+        if (state.is_processed)
+            return PathState::Processed;
     }
     else
     {
         /// For unordered mode each processed/failed file gets its own dedicated node.
         const auto processed_node_path = (zookeeper_path / "processed" / node_name).string();
+        const std::vector<std::string> paths = {processed_node_path, failed_node_path};
 
-        std::string processed_data;
-        std::string failed_data;
-        bool processed_node_exists = false;
-        bool failed_node_exists = false;
-
+        /// Retry covers only the ZK round-trip, matching the pattern in
+        /// ObjectStorageQueueOrderedFileMetadata::getProcessingStateFromKeeper.
+        zkutil::ZooKeeper::MultiTryGetResponse responses;
         getKeeperRetriesControl(log).retryLoop([&]
         {
-            auto zk = getZooKeeper();
-            auto responses = zk->tryGet({processed_node_path, failed_node_path});
-            processed_node_exists = (responses[0].error == Coordination::Error::ZOK);
-            failed_node_exists = (responses[1].error == Coordination::Error::ZOK);
-            if (failed_node_exists)
-                failed_data = responses[1].data;
+            responses = getZooKeeper()->tryGet(paths);
         });
 
-        if (processed_node_exists)
+        /// Guardrails: prove the response vector is the right size, then check every
+        /// error code before touching any element — same pattern as the ordered helper.
+        if (responses.size() != paths.size())
+            throw Exception(ErrorCodes::UNEXPECTED_ZOOKEEPER_ERROR,
+                "Unexpected size of Keeper response: expected {}, got {}",
+                paths.size(), responses.size());
+        for (size_t i = 0; i < responses.size(); ++i)
+        {
+            const auto err = responses[i].error;
+            if (err != Coordination::Error::ZOK && err != Coordination::Error::ZNONODE)
+                throw zkutil::KeeperException::fromPath(err, paths[i]);
+        }
+
+        if (responses[0].error == Coordination::Error::ZOK)
             return PathState::Processed;
 
-        if (failed_node_exists)
+        if (responses[1].error == Coordination::Error::ZOK)
         {
-            if (!failed_data.empty())
-                failure_message = ObjectStorageQueueIFileMetadata::NodeMetadata::fromString(failed_data).last_exception;
+            if (!responses[1].data.empty())
+                failure_message = ObjectStorageQueueIFileMetadata::NodeMetadata::fromString(responses[1].data).last_exception;
             return PathState::Failed;
         }
     }
